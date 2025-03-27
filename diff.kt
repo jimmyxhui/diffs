@@ -1,142 +1,126 @@
-data class Change(
-    val op: String,         // e.g., "replace", "add", "remove"
-    val path: String,       // e.g., "/a/idA/b/idB/c"
-    val value: Any? = null, // New value (optional)
-    val itemIds: List<String> = emptyList() // IDs for array elements, e.g., ["idA", "idB"]
-)
-
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.flipkart.zjsonpatch.JsonDiff
 
-class DiffService(private val objectMapper: ObjectMapper) {
+class DiffGenerator(private val objectMapper: ObjectMapper = jacksonObjectMapper()) {
 
-    fun computeDiff(oldNode: JsonNode, newNode: JsonNode): List<Change> {
-        // Transform arrays to maps based on "id"
-        val oldTransformed = transformToMap(oldNode)
-        val newTransformed = transformToMap(newNode)
+    fun <T : Any> computeDiff(oldObj: T, newObj: T): List<Change> {
+        val oldJson = objectMapper.valueToTree<JsonNode>(oldObj)
+        val newJson = objectMapper.valueToTree<JsonNode>(newObj)
+        val patch = JsonDiff.asJson(oldJson, newJson)
+        return transformPatchToChanges(patch, oldJson, newJson)
+    }
 
-        // Compute the patch using zjsonpatch
-        val patch = JsonDiff.asJson(oldTransformed, newTransformed)
-
-        // Convert patch operations to Change objects
-        return patch.map { operation ->
-            val path = operation["path"].asText()
+    private fun transformPatchToChanges(patch: JsonNode, oldJson: JsonNode, newJson: JsonNode): List<Change> {
+        val changes = mutableListOf<Change>()
+        patch.forEach { operation ->
             val op = operation["op"].asText()
+            val path = operation["path"].asText()
             val value = operation["value"]?.let { objectMapper.treeToValue(it, Any::class.java) }
-            val itemIds = extractItemIds(path, oldNode)
-            Change(op, path, value, itemIds)
+
+            // Extract itemIds by traversing the path in the original JSON
+            val itemIds = extractItemIds(path, oldJson, newJson, op)
+            changes.add(Change(op = op, path = path, value = value, itemIds = itemIds))
         }
+        return changes
     }
 
-    private fun transformToMap(node: JsonNode): JsonNode {
-        if (node.isArray) {
-            val mapNode = objectMapper.createObjectNode()
-            node.elements().forEach { element ->
-                val id = element.get("id")?.asText() ?: throw IllegalArgumentException("Missing id in array element")
-                mapNode.set<JsonNode>(id, element)
-            }
-            return mapNode
-        } else if (node.isObject) {
-            val transformed = objectMapper.createObjectNode()
-            node.fields().forEach { (key, value) ->
-                transformed.set<JsonNode>(key, transformToMap(value))
-            }
-            return transformed
-        }
-        return node
-    }
-
-    private fun extractItemIds(path: String, node: JsonNode): List<String> {
-        val parts = path.split("/").filter { it.isNotEmpty() }
+    private fun extractItemIds(path: String, oldJson: JsonNode, newJson: JsonNode, op: String): List<String> {
         val itemIds = mutableListOf<String>()
-        var current = node
-        for (part in parts) {
-            if (current.isArray && part.toIntOrNull() != null) {
-                val index = part.toInt()
-                val id = current.get(index)?.get("id")?.asText() ?: throw IllegalArgumentException("Missing id at $path")
-                itemIds.add(id)
-                current = current.get(index)
-            } else if (current.isObject) {
-                current = current.get(part) ?: throw IllegalArgumentException("Field $part not found")
+        val segments = path.split("/").filter { it.isNotEmpty() }
+        var currentNode = if (op == "add") newJson else oldJson // Use newJson for "add" ops, oldJson otherwise
+
+        for (i in segments.indices) {
+            val segment = segments[i]
+            if (segment.matches(Regex("\\d+"))) { // Array index
+                val index = segment.toInt()
+                if (currentNode.isArray && index < currentNode.size()) {
+                    val element = currentNode[index]
+                    if (element.isObject && element.has("id")) {
+                        itemIds.add(element["id"].asText())
+                    }
+                    currentNode = element // Move deeper into the structure
+                }
+            } else if (currentNode.isObject && currentNode.has(segment)) {
+                currentNode = currentNode[segment] // Move to the named field
             }
         }
         return itemIds
     }
 }
 
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.flipkart.zjsonpatch.JsonPatch
+import org.springframework.data.mongodb.repository.MongoRepository
+import org.springframework.kafka.core.KafkaTemplate
+import org.springframework.stereotype.Service
+import kotlin.reflect.KClass
 
-fun applyChange(change: Change, currentNode: JsonNode, objectMapper: ObjectMapper): JsonNode {
-    val pathParts = change.path.split("/").filter { it.isNotEmpty() }
-    var adjustedPath = ""
-    var current = currentNode
-    var itemIdIndex = 0
+@Service
+class DocumentService(
+    private val diffRepository: MongoRepository<VersionDiff, String>,
+    private val kafkaTemplate: KafkaTemplate<String, List<Change>>,
+    private val diffGenerator: DiffGenerator
+) {
 
-    // Adjust the path based on current itemIds
-    for (part in pathParts) {
-        if (part.matches("\\d+".toRegex()) && current.isArray) {
-            val id = change.itemIds.getOrNull(itemIdIndex++)
-            val targetIndex = if (id != null) {
-                current.elements().asSequence()
-                    .indexOfFirst { it.get("id")?.asText() == id }
-                    .takeIf { it >= 0 } ?: throw IllegalArgumentException("Object with id $id not found at /$adjustedPath")
-            } else {
-                part.toInt()
-            }
-            adjustedPath += "/$targetIndex"
-            current = current.get(targetIndex) ?: throw IllegalArgumentException("Invalid index at /$adjustedPath")
-        } else {
-            adjustedPath += "/$part"
-            current = current.get(part) ?: throw IllegalArgumentException("Field $part not found at /$adjustedPath")
-        }
+    fun <T : Any> updateDocument(
+        repository: MongoRepository<T, String>,
+        collectionName: String,
+        documentId: String,
+        updatedDoc: T,
+        versionField: String = "version"
+    ): T {
+        val oldDoc = repository.findById(documentId)
+            .orElseThrow { IllegalArgumentException("Document not found in $collectionName") }
+
+        val savedDoc = repository.save(updatedDoc)
+        val changes = diffGenerator.computeDiff(oldDoc, savedDoc)
+
+        val oldVersion = oldDoc.getVersion(versionField)
+        val newVersion = savedDoc.getVersion(versionField)
+
+        val versionDiff = VersionDiff(
+            documentId = documentId,
+            collectionName = collectionName,
+            fromVersion = oldVersion,
+            toVersion = newVersion,
+            changes = changes
+        )
+        diffRepository.save(versionDiff)
+
+        kafkaTemplate.send("$collectionName-updates", documentId, changes)
+
+        return savedDoc
     }
 
-    // Create the patch operation
-    val patchOperation = objectMapper.createObjectNode().apply {
-        put("op", change.op)
-        put("path", adjustedPath)
-        change.value?.let { set<JsonNode>("value", objectMapper.valueToTree(it)) }
-    }
-    val patchArray = objectMapper.createArrayNode().apply { add(patchOperation) }
+    fun <T : Any> compareVersions(
+        documentId: String,
+        collectionName: String,
+        fromVersion: Long,
+        toVersion: Long,
+        clazz: KClass<T>
+    ): List<Change> {
+        if (fromVersion >= toVersion) throw IllegalArgumentException("fromVersion must be less than toVersion")
 
-    // Apply the patch using zjsonpatch
-    return JsonPatch.apply(patchArray, currentNode)
+        val diffs = diffRepository.findAllByDocumentIdAndCollectionNameAndFromVersionGreaterThanEqualOrderByFromVersion(
+            documentId, collectionName, fromVersion
+        ).filter { it.toVersion <= toVersion }
+
+        if (diffs.isEmpty()) return emptyList()
+
+        // Merge changes (simple concatenation for now)
+        return diffs.flatMap { it.changes }
+    }
+
+    private fun Any.getVersion(versionField: String): Long {
+        val json = objectMapper.valueToTree<JsonNode>(this)
+        return json[versionField].asLong()
+    }
 }
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Test
-
-class DiffServiceTest {
-    private val objectMapper = ObjectMapper()
-    private val diffService = DiffService(objectMapper)
-
-    @Test
-    fun `diff and apply should work with zjsonpatch`() {
-        val oldJson = """{"a": [{"id": "idA", "b": [{"id": "idB", "c": "value"}]}]}"""
-        val newJson = """{"a": [{"id": "idA", "b": [{"id": "idB", "c": "newValue"}]}]}"""
-        val currentJson = """{"a": [{"id": "idX", "b": []}, {"id": "idA", "b": [{"id": "idY", "c": "other"}, {"id": "idB", "c": "value"}]}]}"""
-
-        val oldNode = objectMapper.readTree(oldJson)
-        val newNode = objectMapper.readTree(newJson)
-        val currentNode = objectMapper.readTree(currentJson)
-
-        // Compute diff
-        val changes = diffService.computeDiff(oldNode, newNode)
-        assertEquals(1, changes.size)
-        with(changes[0]) {
-            assertEquals("replace", op)
-            assertEquals("/a/idA/b/idB/c", path)
-            assertEquals("newValue", value)
-            assertEquals(listOf("idA", "idB"), itemIds)
-        }
-
-        // Apply change
-        val updatedNode = applyChange(changes[0], currentNode, objectMapper)
-        val expectedJson = """{"a": [{"id": "idX", "b": []}, {"id": "idA", "b": [{"id": "idY", "c": "other"}, {"id": "idB", "c": "newValue"}]}]}"""
-        assertEquals(objectMapper.readTree(expectedJson), updatedNode)
-    }
+interface VersionDiffRepository : MongoRepository<VersionDiff, String> {
+    fun findAllByDocumentIdAndCollectionNameAndFromVersionGreaterThanEqualOrderByFromVersion(
+        documentId: String,
+        collectionName: String,
+        fromVersion: Long
+    ): List<VersionDiff>
 }
