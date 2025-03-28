@@ -3,6 +3,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.flipkart.zjsonpatch.JsonDiff
 
+
 class DiffGenerator(private val objectMapper: ObjectMapper = jacksonObjectMapper()) {
 
     fun <T : Any> computeDiff(oldObj: T, newObj: T): List<Change> {
@@ -48,6 +49,52 @@ class DiffGenerator(private val objectMapper: ObjectMapper = jacksonObjectMapper
         }
         return itemIds
     }
+
+
+    fun applyChange(change: Change, currentNode: JsonNode, objectMapper: ObjectMapper): JsonNode {
+    val pathParts = change.path.split("/").filter { it.isNotEmpty() }
+    var adjustedPath = ""
+    var current = currentNode
+    var itemIdIndex = 0
+
+    if (change.op == "add") {
+        val parentPath = change.path.substring(0, change.path.length - change.path.split("/").last().length - 1)
+        val id = change.path.split("/").last()
+        val value = change.value as Map<String, Any>
+        val newValue = value.toMutableMap().apply { put("id", id) }
+
+        val arrayNode = getNode(currentNode, parentPath) as ArrayNode
+        arrayNode.add(objectMapper.valueToTree(newValue))
+        return currentNode
+    }
+
+    for (i in pathParts.indices) {
+        val part = pathParts[i]
+        if (part.matches("\\d+".toRegex()) && current.isArray) {
+            val id = change.itemIds.get(itemIdIndex++)
+            val targetIndex = if (id != null) {
+                current.elements().asSequence()
+                    .mapIndexed { index, jsonNode -> Pair(index, jsonNode) }
+                    .first { it.second.get("id")?.asText() == id }.first
+            } else {
+                part.toInt()
+            }
+            adjustedPath += "/$targetIndex"
+            current = current.get(targetIndex) ?: throw IllegalArgumentException("Invalid index at /$adjustedPath")
+        } else {
+            adjustedPath += "/$part"
+            current = current.get(part) ?: throw IllegalArgumentException("Field $part not found at /$adjustedPath")
+        }
+    }
+
+    val patchOperation = objectMapper.createObjectNode().apply {
+        put("op", change.op)
+        put("path", adjustedPath)
+        change.value?.let { set<JsonNode>("value", objectMapper.valueToTree(it)) }
+    }
+    val patchArray = objectMapper.createArrayNode().apply { add(patchOperation) }
+    return JsonPatch.apply(patchArray, currentNode)
+}
 }
 
 import org.springframework.data.mongodb.repository.MongoRepository
